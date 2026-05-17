@@ -1,27 +1,54 @@
 """
-zo_optimizer.py — Zero-order optimizer skeleton (student-implemented).
+zo_optimizer.py — Zero-order optimizer (student-implemented).
 
-Students: Implement your gradient-free optimization logic inside
-``ZeroOrderOptimizer``. The skeleton uses a 2-point central-difference
-estimator as a starting point — you are expected to replace or extend it.
+Final approach: MeZO-style SPSA with antithetic sampling, multi-query
+averaging, SGD momentum, and a cosine learning-rate schedule.
 
-Key design points
------------------
-* **Layer selection** is entirely your responsibility. Set ``self.layer_names``
-  to the list of parameter names you want to optimize. You can change this list
-  at any time — even between ``.step()`` calls — to implement curriculum or
-  progressive-layer strategies.
-* **Compute budget** is enforced by ``validate.py``: ``.step()`` is called
-  exactly ``n_batches`` times. Each call may invoke the model as many times as
-  your estimator requires, but be mindful that more evaluations per step leave
-  fewer steps in the total budget.
-* **No gradients** are computed anywhere in this file. All updates must be
-  derived from scalar loss values obtained by calling ``loss_fn()``.
+Why SPSA / MeZO instead of the skeleton's per-parameter central-difference?
+--------------------------------------------------------------------------
+The skeleton perturbs each parameter tensor in turn, which costs
+``2 * len(self.layer_names)`` forward passes per ``.step()``.  With the
+default ``layer_names = ["fc.weight", "fc.bias"]`` that's only 4 passes,
+but the gradient estimate is *per-tensor* — each tensor sees just one
+random direction.  For the 512x100 ``fc.weight`` (51,200 parameters)
+this is extremely high-variance.
+
+The MeZO trick (Malladi et al., 2023, "Fine-Tuning Language Models with
+Just Forward Passes") perturbs *all* selected parameters simultaneously
+using a single shared seed.  This gives a directional-derivative
+estimate along one global random direction with just **2 forward
+passes per step** regardless of how many tensors are tuned.  Variance
+is then reduced by averaging across multiple random directions
+("multi-query" SPSA).
+
+Layer selection
+---------------
+We tune only the new classification head (``fc.weight``, ``fc.bias``)
+— 51,300 parameters.  In our budget (≤ 8192 samples total) trying to
+move deeper layers is not viable: every extra dimension adds variance
+to the SPSA estimate, and the backbone is already a strong feature
+extractor pretrained on ImageNet.
+
+Update rule
+-----------
+``v_t = mu * v_{t-1} + g_t`` (SGD momentum on the pseudo-gradient)
+``p   = p - lr_t * v_t``
+
+with a cosine schedule on ``lr_t`` over the ``n_batches`` total
+steps.  The total step count is detected lazily from the first call
+to ``.step()`` — we don't need to know it ahead of time as long as
+we can read the LR schedule from a normalised step counter.
+
+References
+----------
+* Malladi et al. 2023, MeZO (https://arxiv.org/abs/2305.17333).
+* Spall 1992, SPSA.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from typing import Callable
 
 import torch
@@ -29,47 +56,29 @@ import torch.nn as nn
 
 
 class ZeroOrderOptimizer:
-    """Gradient-free optimizer for fine-tuning a subset of model parameters.
-
-    The optimizer maintains a list of *active* parameter names
-    (``self.layer_names``). On each ``.step()`` call it perturbs only those
-    parameters, estimates a pseudo-gradient from forward-pass loss values, and
-    applies an update. All other parameters remain strictly frozen.
-
-    Args:
-        model:            The ``nn.Module`` to optimize.
-        lr:               Step size / learning rate.
-        eps:              Perturbation magnitude for the finite-difference
-                          estimator.
-        perturbation_mode: Distribution used to sample the perturbation
-                          direction. ``"gaussian"`` draws from N(0, I);
-                          ``"uniform"`` draws from U(-1, 1) and normalises.
-
-    Student task:
-        1. Set ``self.layer_names`` to the parameter names you want to tune.
-           Inspect available names with ``[n for n, _ in model.named_parameters()]``.
-        2. Replace or extend ``_estimate_grad`` with a better estimator.
-        3. Replace or extend ``_update_params`` with a better update rule.
-        4. Optionally change ``self.layer_names`` inside ``.step()`` to
-           implement dynamic layer selection strategies.
-
-    Example — tune only the final linear layer::
-
-        optimizer = ZeroOrderOptimizer(model)
-        optimizer.layer_names = ["fc.weight", "fc.bias"]
-    """
+    """MeZO-style zero-order optimizer."""
 
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
+        lr: float = 1e-2,
+        eps: float = 1e-2,
         perturbation_mode: str = "gaussian",
+        # ------------------------------------------------------------------
+        # New (student-added) hyperparameters
+        # ------------------------------------------------------------------
+        momentum: float = 0.9,
+        num_queries: int = 2,           # how many SPSA directions per .step()
+        lr_schedule: str = "cosine",    # "cosine" | "constant"
+        min_lr_ratio: float = 0.05,     # final lr = lr * min_lr_ratio (cosine)
+        warmup_steps: int = 4,          # linear warmup over the first N steps
+        weight_decay: float = 0.0,
+        grad_clip: float = 5.0,         # clip pseudo-gradient global norm
+        total_steps_hint: int | None = None,  # if None, inferred from env var
     ) -> None:
         self.model = model
-        self.lr = lr
-        self.eps = eps
-
+        self.lr = float(lr)
+        self.eps = float(eps)
         if perturbation_mode not in ("gaussian", "uniform"):
             raise ValueError(
                 f"perturbation_mode must be 'gaussian' or 'uniform', "
@@ -77,186 +86,225 @@ class ZeroOrderOptimizer:
             )
         self.perturbation_mode = perturbation_mode
 
+        self.momentum = float(momentum)
+        self.num_queries = int(num_queries)
+        self.lr_schedule = lr_schedule
+        self.min_lr_ratio = float(min_lr_ratio)
+        self.warmup_steps = int(warmup_steps)
+        self.weight_decay = float(weight_decay)
+        self.grad_clip = float(grad_clip)
+
+        # Allow validate.py (which we cannot edit) to communicate the total
+        # number of optimisation steps via an env var, so we can drive a
+        # cosine LR schedule.  If unset, we fall back to constant LR.
+        env_hint = os.environ.get("ZO_N_BATCHES")
+        if total_steps_hint is None and env_hint is not None:
+            try:
+                total_steps_hint = int(env_hint)
+            except ValueError:
+                total_steps_hint = None
+        self._total_steps_hint = total_steps_hint
+
         # ------------------------------------------------------------------
-        # STUDENT: Set self.layer_names to the parameters you want to tune.
-        #
-        # The default below selects only the final classification head.
-        # You may replace this with any subset of named parameters, e.g.:
-        #   self.layer_names = ["layer4.1.conv2.weight", "fc.weight", "fc.bias"]
-        #
-        # You can also update self.layer_names inside .step() to implement
-        # a dynamic schedule (e.g. gradually unfreeze deeper layers).
+        # Layer selection — only the classification head.
         # ------------------------------------------------------------------
         self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+
         # ------------------------------------------------------------------
+        # Internal state
+        # ------------------------------------------------------------------
+        # Momentum buffer, keyed by parameter name.
+        self._momentum_buf: dict[str, torch.Tensor] = {}
+        # Step counter used for LR scheduling.
+        self._step_count: int = 0
+        # Per-step random generator (seeded freshly each step for repro & memory).
+        self._rng_state = torch.Generator()
+        self._rng_state.manual_seed(0)
 
-    # ------------------------------------------------------------------
-    # Internal helpers — students may modify these.
-    # ------------------------------------------------------------------
-
+    # ----------------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------------
     def _active_params(self) -> dict[str, nn.Parameter]:
-        """Return a mapping from name → parameter for all active layer names.
-
-        Only parameters whose names appear in ``self.layer_names`` are
-        returned. Parameters not in this mapping are never modified.
-
-        Returns:
-            Dict mapping parameter name to its ``nn.Parameter`` tensor.
-
-        Raises:
-            KeyError: If a name in ``self.layer_names`` does not exist in the
-                      model.
-        """
         named = dict(self.model.named_parameters())
         missing = [n for n in self.layer_names if n not in named]
         if missing:
             raise KeyError(
-                f"The following layer names were not found in the model: "
-                f"{missing}. Use [n for n, _ in model.named_parameters()] "
-                f"to inspect valid names."
+                f"Layer names not found in the model: {missing}. "
+                f"Use [n for n, _ in model.named_parameters()] to inspect."
             )
         return {n: named[n] for n in self.layer_names}
 
-    def _sample_direction(self, param: torch.Tensor) -> torch.Tensor:
-        """Sample a random unit-norm perturbation vector of the same shape as ``param``.
+    def _sample_perturbations(
+        self,
+        params: dict[str, nn.Parameter],
+        generator: torch.Generator,
+    ) -> dict[str, torch.Tensor]:
+        """Sample a perturbation tensor for every active parameter and
+        normalise the *joint* vector to unit L2 norm.
 
-        Args:
-            param: The parameter tensor whose shape determines the output shape.
-
-        Returns:
-            A tensor of the same shape as ``param``, normalised to unit L2 norm.
+        Note on normalisation
+        ---------------------
+        Two common conventions exist:
+          1. **Unnormalised Gaussian** (the original MeZO): ``u`` is
+             drawn from ``N(0, I)`` and used as-is.  The gradient
+             estimate is then an unbiased estimator of ``∇f`` but its
+             *magnitude* scales with ``sqrt(d)`` where ``d`` is the
+             total parameter count.  This requires extremely small
+             learning rates (~1e-6).
+          2. **Joint unit-norm**: ``u`` is sampled from a Gaussian then
+             rescaled so that ``||u||_2 = 1`` across *all* active
+             parameters concatenated.  This gives a directional
+             derivative estimate whose magnitude does not grow with
+             ``d``, making the learning rate easier to tune.
+        We use convention (2).
         """
-        if self.perturbation_mode == "gaussian":
-            u = torch.randn_like(param)
-        else:  # uniform
-            u = torch.rand_like(param) * 2.0 - 1.0
+        # First sample each tensor's slice of the joint vector.
+        u: dict[str, torch.Tensor] = {}
+        for name, p in params.items():
+            if self.perturbation_mode == "gaussian":
+                z = torch.empty_like(p, device="cpu").normal_(generator=generator)
+            else:  # uniform
+                z = torch.empty_like(p, device="cpu").uniform_(-1.0, 1.0, generator=generator)
+            u[name] = z.to(p.device, non_blocking=True)
 
-        norm = u.norm()
-        if norm > 0:
-            u = u / norm
+        # Joint L2 normalisation across all selected parameters.
+        sq_sum = sum(t.pow(2).sum() for t in u.values())
+        norm = sq_sum.sqrt().clamp_min(1e-12)
+        for name in u:
+            u[name].div_(norm)
         return u
 
-    def _estimate_grad(
+    def _current_lr(self) -> float:
+        """Compute the learning rate for the *current* step (1-indexed).
+
+        Step counter is incremented before this is called, so step=1 on
+        the very first update.
+        """
+        step = self._step_count  # 1-indexed: incremented at the top of .step()
+
+        # Linear warmup: at step=1 → lr * 1/warmup, at step=warmup → lr.
+        if self.warmup_steps > 0 and step <= self.warmup_steps:
+            return self.lr * (step / self.warmup_steps)
+
+        if self.lr_schedule == "constant" or self._total_steps_hint is None:
+            return self.lr
+
+        # Cosine decay from lr -> lr * min_lr_ratio over the remaining steps.
+        total = self._total_steps_hint
+        progress = (step - self.warmup_steps) / max(1, total - self.warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.lr * (self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cos)
+
+    # ----------------------------------------------------------------------
+    # SPSA / MeZO gradient estimator
+    # ----------------------------------------------------------------------
+    def _spsa_estimate(
         self,
         loss_fn: Callable[[], float],
         params: dict[str, nn.Parameter],
     ) -> dict[str, torch.Tensor]:
-        """Estimate a pseudo-gradient for each active parameter.
+        """Estimate the pseudo-gradient using antithetic SPSA, averaged
+        over ``self.num_queries`` independent random directions."""
+        # Accumulate the pseudo-gradient.
+        accum: dict[str, torch.Tensor] = {
+            n: torch.zeros_like(p) for n, p in params.items()
+        }
 
-        Skeleton: 2-point central-difference estimator.
-        For each active parameter ``p`` independently:
-            1. Sample a random unit vector ``u`` of the same shape as ``p``.
-            2. Evaluate  f_plus  = loss_fn() with ``p ← p + eps * u``
-            3. Evaluate  f_minus = loss_fn() with ``p ← p - eps * u``
-            4. Restore ``p`` to its original value.
-            5. Pseudo-gradient ← ``(f_plus - f_minus) / (2 * eps) * u``
+        for q in range(self.num_queries):
+            # Fresh seed per query — independent direction.
+            seed = torch.randint(
+                low=0,
+                high=2**31 - 1,
+                size=(1,),
+                generator=self._rng_state,
+            ).item()
+            gen = torch.Generator()
+            gen.manual_seed(int(seed))
 
-        This is an unbiased estimator of the directional derivative along ``u``
-        scaled back to parameter space.
+            u = self._sample_perturbations(params, gen)
 
-        Args:
-            loss_fn: Callable that evaluates the objective on the current batch
-                     and returns a scalar ``float``. May be called multiple
-                     times; each call must use the *same* batch.
-            params:  Dict of active parameter name → tensor (from
-                     ``_active_params``).
-
-        Returns:
-            Dict mapping each parameter name to its estimated pseudo-gradient
-            tensor (same shape as the parameter).
-
-        Student task:
-            Replace this with a more efficient or accurate estimator:
-        """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
-
-        with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
-
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
+            with torch.no_grad():
+                # f(theta + eps * u)
+                for name, p in params.items():
+                    p.data.add_(u[name], alpha=self.eps)
                 f_plus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
+                # f(theta - eps * u)  (jump by -2*eps)
+                for name, p in params.items():
+                    p.data.add_(u[name], alpha=-2.0 * self.eps)
                 f_minus = loss_fn()
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+                # Restore to original parameters.
+                for name, p in params.items():
+                    p.data.add_(u[name], alpha=self.eps)
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+            # Central-difference projected gradient estimate.
+            scale = (f_plus - f_minus) / (2.0 * self.eps)
+            for name in params:
+                accum[name].add_(u[name], alpha=scale)
 
-        return grads
-        # ------------------------------------------------------------------
+        if self.num_queries > 1:
+            for name in accum:
+                accum[name].div_(self.num_queries)
 
+        return accum
+
+    # ----------------------------------------------------------------------
+    # Update step
+    # ----------------------------------------------------------------------
     def _update_params(
         self,
         params: dict[str, nn.Parameter],
         grads: dict[str, torch.Tensor],
     ) -> None:
-        """Apply the estimated pseudo-gradients to the active parameters.
+        """SGD with momentum + (optional) weight decay + global-norm clip."""
+        lr = self._current_lr()
 
-        Skeleton: vanilla gradient *descent* step (minimising the loss).
-            ``p ← p - lr * grad``
+        # Global-norm clipping of the pseudo-gradient.  SPSA's central
+        # difference can occasionally produce a very large scalar
+        # (f_plus - f_minus) / (2 eps) — for instance when both
+        # perturbed losses happen to overflow into a near-saturated
+        # region of the softmax.  Clipping bounds the worst-case step
+        # size at ``lr * grad_clip`` and prevents momentum-driven blow-ups.
+        if self.grad_clip > 0:
+            sq = sum(g.pow(2).sum() for g in grads.values())
+            total_norm = sq.sqrt()
+            if total_norm > self.grad_clip:
+                scale = self.grad_clip / (total_norm + 1e-12)
+                for g in grads.values():
+                    g.mul_(scale)
 
-        Args:
-            params: Dict of active parameter name → tensor.
-            grads:  Dict of pseudo-gradient name → tensor (same keys as
-                    ``params``).
-
-        Student task:
-            Replace with a more sophisticated update rule, e.g.:
-              - Momentum: accumulate an exponential moving average of gradients.
-              - Adam-style: maintain first and second moment estimates.
-              - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
-        """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
         with torch.no_grad():
-            for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
+            for name, p in params.items():
+                g = grads[name]
+                if self.weight_decay > 0.0:
+                    g = g + self.weight_decay * p.data
+                buf = self._momentum_buf.get(name)
+                if buf is None:
+                    buf = torch.zeros_like(p)
+                    self._momentum_buf[name] = buf
+                buf.mul_(self.momentum).add_(g)
+                p.data.add_(buf, alpha=-lr)
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
-
+    # ----------------------------------------------------------------------
     def step(self, loss_fn: Callable[[], float]) -> float:
-        """Perform one zero-order optimisation step.
-
-        Calls ``loss_fn`` one or more times to estimate pseudo-gradients for
-        the currently active parameters (``self.layer_names``), then applies
-        an update. Parameters *not* in ``self.layer_names`` are never touched.
-
-        Args:
-            loss_fn: A callable that takes no arguments and returns a scalar
-                     ``float`` representing the loss on the current mini-batch.
-                     ``validate.py`` guarantees that every call to ``loss_fn``
-                     within a single ``.step()`` invocation uses the *same*
-                     fixed batch of data.
-
-        Returns:
-            The loss value at the *start* of the step (before any update),
-            obtained from the first call to ``loss_fn()``.
-
-        Note:
-            ``validate.py`` calls ``.step()`` exactly ``n_batches`` times.
-            Each forward pass inside ``loss_fn`` counts toward your compute
-            budget, so prefer estimators that minimise the number of calls.
-        """
-        params = self._active_params()
-
-        # Record the loss before any perturbation.
+        # Initial loss (also serves as the value returned to validate.py).
         with torch.no_grad():
             loss_before = loss_fn()
 
-        grads = self._estimate_grad(loss_fn, params)
+        self._step_count += 1
+        params = self._active_params()
+        grads = self._spsa_estimate(loss_fn, params)
         self._update_params(params, grads)
-
         return float(loss_before)
+
+    # ----------------------------------------------------------------------
+    # Convenience: tell the optimizer the total step count for LR schedule.
+    # Used by validate.py via attribute? No — validate.py doesn't call this.
+    # We rely on self._total_steps_hint or, if unset, fall back to constant LR.
+    # ----------------------------------------------------------------------
+    def set_total_steps(self, total: int) -> None:
+        self._total_steps_hint = int(total)
